@@ -10,17 +10,15 @@ puppeteer.use(StealthPlugin());
 
 const app = express();
 const PORT = process.env.PORT || 7000;
-
-// FIX: Use Render's external URL if available, otherwise localhost
 const BASE_URL = process.env.RENDER_EXTERNAL_URL || process.env.BASE_URL || `http://127.0.0.1:${PORT}`;
 
 app.use(cors());
 
 const builder = new addonBuilder({
     id: "org.bollywood.render",
-    version: "2.3.0",
+    version: "2.4.0", // Bump version
     name: "Bollywood Cloud",
-    description: "Cloud-hosted addon",
+    description: "Cloud-hosted addon with Lazy Timeouts",
     resources: ["stream"],
     types: ["movie"],
     catalogs: []
@@ -47,7 +45,6 @@ builder.defineStreamHandler(async ({ type, id }) => {
     try {
         const isProduction = process.env.NODE_ENV === 'production';
 
-        // FIX: Removed '--single-process' which causes crashes on Render
         browser = await puppeteer.launch({
             headless: isProduction ? "new" : false, 
             args: [
@@ -63,7 +60,7 @@ builder.defineStreamHandler(async ({ type, id }) => {
 
         const page = await browser.newPage();
         
-        // Optimizations to save memory/bandwidth
+        // Block heavy assets to speed up loading
         await page.setRequestInterception(true);
         page.on('request', (req) => {
             if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) {
@@ -74,26 +71,40 @@ builder.defineStreamHandler(async ({ type, id }) => {
         });
 
         const directUrl = `https://bollywood.eu.org/?type=movie&id=${meta.tmdbId}`;
-        await page.goto(directUrl, { waitUntil: 'domcontentloaded' });
+        
+        // Increase page load timeout to 60s for slow servers
+        await page.goto(directUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-        // Auto-Clicker
-        console.log("⏳ Checking for files...");
+        // DEBUG: Check if we are blocked immediately
+        const pageTitle = await page.title();
+        console.log(`📄 Page Title: "${pageTitle}"`);
+        if (pageTitle.includes("Just a moment") || pageTitle.includes("Cloudflare")) {
+            console.log("❌ BLOCKED: Cloudflare challenge detected.");
+            // We can't solve this easily in headless free tier, but at least we know why.
+        }
+
+        // Auto-Clicker: Give it 15 seconds (was 4s)
+        console.log("⏳ Checking for 'View All Files' button (15s timeout)...");
         try {
             await page.waitForFunction(
                 () => [...document.querySelectorAll('button, a')].some(b => b.innerText.includes('View All Files')),
-                { timeout: 4000 }
+                { timeout: 15000 }
             );
             await page.evaluate(() => {
                 const buttons = [...document.querySelectorAll('button, a')];
                 const viewButton = buttons.find(b => b.innerText.includes('View All Files'));
                 if (viewButton) viewButton.click();
             });
-        } catch (e) {}
-
-        try {
-            await page.waitForSelector('.file-result', { timeout: 6000 });
         } catch (e) {
-            console.log("⚠️ Selector timeout (Files might be missing or slow).");
+            console.log("ℹ️ Button not found (or files already visible).");
+        }
+
+        // Wait for Files: Give it 30 seconds (was 6s)
+        console.log("⏳ Waiting for file list to populate (30s timeout)...");
+        try {
+            await page.waitForSelector('.file-result', { timeout: 30000 });
+        } catch (e) {
+            console.log("⚠️ Selector timeout. The server is too slow or the page failed to render JS.");
         }
 
         const content = await page.content();
