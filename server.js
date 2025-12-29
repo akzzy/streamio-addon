@@ -14,37 +14,48 @@ const BASE_URL = process.env.RENDER_EXTERNAL_URL || process.env.BASE_URL || `htt
 
 app.use(cors());
 
+// Helper: Pause for X milliseconds
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
 const builder = new addonBuilder({
-    id: "org.bollywood.render",
-    version: "2.4.0", // Bump version
-    name: "Bollywood Cloud",
-    description: "Cloud-hosted addon with Lazy Timeouts",
+    id: "org.bollywood.patient",
+    version: "3.5.0",
+    name: "Bollywood Patient",
+    description: "Calculated Wait Times for Series",
     resources: ["stream"],
-    types: ["movie"],
+    types: ["movie", "series"],
     catalogs: []
 });
 
-async function getTmdbId(imdbId) {
+async function getTmdbId(imdbId, type) {
     try {
-        const url = `https://v3-cinemeta.strem.io/meta/movie/${imdbId}.json`;
+        const metaType = type === 'series' ? 'series' : 'movie';
+        const url = `https://v3-cinemeta.strem.io/meta/${metaType}/${imdbId}.json`;
         const res = await axios.get(url);
         return { tmdbId: res.data.meta.moviedb_id, name: res.data.meta.name };
     } catch (e) { return null; }
 }
 
 builder.defineStreamHandler(async ({ type, id }) => {
-    if (type !== "movie") return { streams: [] };
-    
-    const meta = await getTmdbId(id);
-    if (!meta || !meta.tmdbId) return { streams: [] };
-    console.log(`\n🎬 Request: ${meta.name} (TMDB: ${meta.tmdbId})`);
-
     let streams = [];
     let browser = null;
+    let imdbId, season, episode;
+
+    if (type === "series") {
+        [imdbId, season, episode] = id.split(":");
+    } else {
+        imdbId = id;
+    }
+
+    const meta = await getTmdbId(imdbId, type);
+    if (!meta || !meta.tmdbId) return { streams: [] };
+
+    const showName = meta.name;
+    console.log(`\n🎬 Request: ${showName} ${type === 'series' ? `(S${season} E${episode})` : ''}`);
 
     try {
         const isProduction = process.env.NODE_ENV === 'production';
-
+        
         browser = await puppeteer.launch({
             headless: isProduction ? "new" : false, 
             args: [
@@ -59,71 +70,120 @@ builder.defineStreamHandler(async ({ type, id }) => {
         });
 
         const page = await browser.newPage();
-        
-        // Block heavy assets to speed up loading
+
+        // Enable CSS for correct button placement
         await page.setRequestInterception(true);
         page.on('request', (req) => {
-            if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) {
+            if (['image', 'font', 'media'].includes(req.resourceType())) {
                 req.abort();
             } else {
                 req.continue();
             }
         });
 
-        const directUrl = `https://bollywood.eu.org/?type=movie&id=${meta.tmdbId}`;
-        
-        // Increase page load timeout to 60s for slow servers
-        await page.goto(directUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        if (type === "series") {
+            // --- SERIES LOGIC ---
+            const encodedName = encodeURIComponent(showName);
+            const directUrl = `https://bollywood.eu.org/?type=show_season&id=${meta.tmdbId}&season=${season}&name=${encodedName}`;
+            console.log(`🌍 Navigating to: ${directUrl}`);
+            
+            // Wait for network idle
+            await page.goto(directUrl, { waitUntil: 'networkidle2', timeout: 60000 });
 
-        // DEBUG: Check if we are blocked immediately
-        const pageTitle = await page.title();
-        console.log(`📄 Page Title: "${pageTitle}"`);
-        if (pageTitle.includes("Just a moment") || pageTitle.includes("Cloudflare")) {
-            console.log("❌ BLOCKED: Cloudflare challenge detected.");
-            // We can't solve this easily in headless free tier, but at least we know why.
+            const episodeSelector = `#episode_${season}_${episode}`;
+            console.log(`⏳ Searching for Episode ${episode} card...`);
+            
+            try {
+                await page.waitForSelector(episodeSelector, { timeout: 20000 });
+                console.log("✅ Card Found. Scrolling into view...");
+                
+                await page.evaluate((selector) => {
+                    const element = document.querySelector(selector);
+                    if (element) element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                }, episodeSelector);
+
+                // --- INTELLIGENT WAIT ---
+                // Calculate wait time: 2.5 seconds per previous episode
+                // Episode 1 = 2.5s, Episode 5 = 12.5s wait
+                const waitTime = parseInt(episode) * 2500;
+                console.log(`⏳ Intelligent Wait: Pausing ${waitTime/1000}s for previous episodes to scan...`);
+                await sleep(waitTime);
+
+                // --- THE HAMMER STRATEGY (NOW WITH PATIENCE) ---
+                let success = false;
+                for (let attempt = 1; attempt <= 4; attempt++) {
+                    console.log(`🖱️ Click Attempt ${attempt}...`);
+                    
+                    await page.evaluate((selector) => {
+                        const card = document.querySelector(selector);
+                        const buttons = [...card.querySelectorAll('button')]; 
+                        const viewButton = buttons.find(b => b.innerText.includes('View All'));
+                        if (viewButton) viewButton.click();
+                    }, episodeSelector);
+
+                    try {
+                        await page.waitForSelector('.file-result', { timeout: 4000 });
+                        console.log("🎉 Click worked! File list opened.");
+                        success = true;
+                        break; 
+                    } catch (e) {
+                        console.log("⚠️ Click failed. Retrying in 3s...");
+                        await sleep(3000);
+                    }
+                }
+                
+                if (!success) console.log("❌ All click attempts failed.");
+
+            } catch (e) {
+                console.log(`ℹ️ Episode ${episode} not found.`);
+                return { streams: [] };
+            }
+
+        } else {
+            // --- MOVIE LOGIC (UNCHANGED) ---
+            const directUrl = `https://bollywood.eu.org/?type=movie&id=${meta.tmdbId}`;
+            await page.goto(directUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+            console.log("⏳ Checking for 'View All Files' button...");
+            try {
+                await page.waitForFunction(
+                    () => [...document.querySelectorAll('button, a')].some(b => b.innerText.includes('View All Files')),
+                    { timeout: 15000 }
+                );
+                await page.evaluate(() => {
+                    const buttons = [...document.querySelectorAll('button, a')];
+                    const viewButton = buttons.find(b => b.innerText.includes('View All Files'));
+                    if (viewButton) viewButton.click();
+                });
+            } catch (e) {}
         }
 
-        // Auto-Clicker: Give it 15 seconds (was 4s)
-        console.log("⏳ Checking for 'View All Files' button (15s timeout)...");
-        try {
-            await page.waitForFunction(
-                () => [...document.querySelectorAll('button, a')].some(b => b.innerText.includes('View All Files')),
-                { timeout: 15000 }
-            );
-            await page.evaluate(() => {
-                const buttons = [...document.querySelectorAll('button, a')];
-                const viewButton = buttons.find(b => b.innerText.includes('View All Files'));
-                if (viewButton) viewButton.click();
-            });
-        } catch (e) {
-            console.log("ℹ️ Button not found (or files already visible).");
-        }
-
-        // Wait for Files: Give it 30 seconds (was 6s)
-        console.log("⏳ Waiting for file list to populate (30s timeout)...");
+        // --- SCRAPE RESULTS ---
+        console.log("⏳ Waiting for file list (30s timeout)...");
         try {
             await page.waitForSelector('.file-result', { timeout: 30000 });
-        } catch (e) {
-            console.log("⚠️ Selector timeout. The server is too slow or the page failed to render JS.");
+            
+            const content = await page.content();
+            const $ = cheerio.load(content);
+    
+            $(".file-result").each((i, element) => {
+                const fileName = $(element).find(".file-name").text().trim();
+                const fileSize = $(element).find("p:contains('Size:')").text().replace("Size:", "").trim();
+                const buttonHtml = $(element).find("button.download-button").attr("onclick");
+                const match = buttonHtml ? buttonHtml.match(/generateFileLink\('([^']+)'\)/) : null;
+    
+                if (fileName && match && match[1]) {
+                    streams.push({
+                        title: `${fileName}\n📦 ${fileSize}`,
+                        url: `${BASE_URL}/stream/${match[1]}` 
+                    });
+                }
+            });
+            console.log(`✅ Success! Found ${streams.length} files.`);
+
+        } catch(e) {
+             console.log("⚠️ File list did not appear (No streams found).");
         }
-
-        const content = await page.content();
-        const $ = cheerio.load(content);
-
-        $(".file-result").each((i, element) => {
-            const fileName = $(element).find(".file-name").text().trim();
-            const fileSize = $(element).find("p:contains('Size:')").text().replace("Size:", "").trim();
-            const buttonHtml = $(element).find("button.download-button").attr("onclick");
-            const match = buttonHtml ? buttonHtml.match(/generateFileLink\('([^']+)'\)/) : null;
-
-            if (fileName && match && match[1]) {
-                streams.push({
-                    title: `${fileName}\n📦 ${fileSize}`,
-                    url: `${BASE_URL}/stream/${match[1]}` 
-                });
-            }
-        });
-        console.log(`✅ Success! Found ${streams.length} files.`);
 
     } catch (error) {
         console.error("❌ Browser Error:", error.message);
@@ -153,7 +213,6 @@ app.all('/stream/:id', async (req, res) => {
             try {
                 const headRes = await axios.head(realUrl, { headers, validateStatus: () => true });
                 if (headRes.headers['content-length']) res.set('Content-Length', headRes.headers['content-length']);
-                if (headRes.headers['content-type']) res.set('Content-Type', headRes.headers['content-type']);
                 res.status(200).end();
                 return;
             } catch (e) {
@@ -176,6 +235,6 @@ const addonRouter = getRouter(addonInterface);
 app.use("/", addonRouter);
 
 app.listen(PORT, () => {
-    console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`🚀 Addon Ready (Intelligent Wait)`);
     console.log(`🌍 Base URL: ${BASE_URL}`);
 });
