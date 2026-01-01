@@ -18,9 +18,9 @@ app.use(cors());
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 const builder = new addonBuilder({
-    id: "org.bollywood.patient",
-    version: "3.5.0",
-    name: "Bollywood Patient",
+    id: "org.hashes.patient",
+    version: "3.8.0",
+    name: "Hashes",
     description: "Calculated Wait Times for Series",
     resources: ["stream"],
     types: ["movie", "series"],
@@ -34,6 +34,36 @@ async function getTmdbId(imdbId, type) {
         const res = await axios.get(url);
         return { tmdbId: res.data.meta.moviedb_id, name: res.data.meta.name };
     } catch (e) { return null; }
+}
+
+// --- HELPER: Scrape Files from the Modal ---
+async function scrapeFiles(page) {
+    const streams = [];
+    try {
+        await page.waitForSelector('.gc-file-list', { timeout: 30000 });
+        await sleep(1000); 
+
+        const content = await page.content();
+        const $ = cheerio.load(content);
+
+        $(".gc-file-item").each((i, element) => {
+            const fileName = $(element).find(".gc-file-name").text().trim();
+            const quality = $(element).find(".gc-quality-badge").text().trim();
+            const size = $(element).find(".gc-file-meta span").last().text().trim();
+            const fileId = $(element).find("button.gc-download-btn").attr("data-file-id");
+
+            if (fileName && fileId) {
+                streams.push({
+                    title: `${fileName}\n📦 ${size} | 📺 ${quality}`,
+                    url: `${BASE_URL}/stream/${fileId}`
+                });
+            }
+        });
+        return streams;
+    } catch (e) {
+        console.log("⚠️ Error scraping files (Modal might not have opened):", e.message);
+        return [];
+    }
 }
 
 builder.defineStreamHandler(async ({ type, id }) => {
@@ -50,8 +80,7 @@ builder.defineStreamHandler(async ({ type, id }) => {
     const meta = await getTmdbId(imdbId, type);
     if (!meta || !meta.tmdbId) return { streams: [] };
 
-    const showName = meta.name;
-    console.log(`\n🎬 Request: ${showName} ${type === 'series' ? `(S${season} E${episode})` : ''}`);
+    console.log(`\n🎬 Request: ${meta.name} ${type === 'series' ? `(S${season} E${episode})` : ''}`);
 
     try {
         const isProduction = process.env.NODE_ENV === 'production';
@@ -71,10 +100,9 @@ builder.defineStreamHandler(async ({ type, id }) => {
 
         const page = await browser.newPage();
 
-        // Enable CSS for correct button placement
         await page.setRequestInterception(true);
         page.on('request', (req) => {
-            if (['image', 'font', 'media'].includes(req.resourceType())) {
+            if (['image', 'media', 'font'].includes(req.resourceType())) {
                 req.abort();
             } else {
                 req.continue();
@@ -82,108 +110,50 @@ builder.defineStreamHandler(async ({ type, id }) => {
         });
 
         if (type === "series") {
-            // --- SERIES LOGIC ---
-            const encodedName = encodeURIComponent(showName);
-            const directUrl = `https://bollywood.eu.org/?type=show_season&id=${meta.tmdbId}&season=${season}&name=${encodedName}`;
+            const directUrl = `https://bollywood.eu.org/#/tv/${meta.tmdbId}/season/${season}`;
             console.log(`🌍 Navigating to: ${directUrl}`);
-            
-            // Wait for network idle
             await page.goto(directUrl, { waitUntil: 'networkidle2', timeout: 60000 });
 
-            const episodeSelector = `#episode_${season}_${episode}`;
-            console.log(`⏳ Searching for Episode ${episode} card...`);
+            const episodeSelector = `.gc-episode-download-btn[data-episode="${episode}"]`;
+
+            console.log(`⏳ Waiting for Episode ${episode} button...`);
             
             try {
                 await page.waitForSelector(episodeSelector, { timeout: 20000 });
-                console.log("✅ Card Found. Scrolling into view...");
                 
                 await page.evaluate((selector) => {
-                    const element = document.querySelector(selector);
-                    if (element) element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    const el = document.querySelector(selector);
+                    if(el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
                 }, episodeSelector);
-
-                // --- INTELLIGENT WAIT ---
-                // Calculate wait time: 2.5 seconds per previous episode
-                // Episode 1 = 2.5s, Episode 5 = 12.5s wait
-                const waitTime = parseInt(episode) * 2500;
-                console.log(`⏳ Intelligent Wait: Pausing ${waitTime/1000}s for previous episodes to scan...`);
-                await sleep(waitTime);
-
-                // --- THE HAMMER STRATEGY (NOW WITH PATIENCE) ---
-                let success = false;
-                for (let attempt = 1; attempt <= 4; attempt++) {
-                    console.log(`🖱️ Click Attempt ${attempt}...`);
-                    
-                    await page.evaluate((selector) => {
-                        const card = document.querySelector(selector);
-                        const buttons = [...card.querySelectorAll('button')]; 
-                        const viewButton = buttons.find(b => b.innerText.includes('View All'));
-                        if (viewButton) viewButton.click();
-                    }, episodeSelector);
-
-                    try {
-                        await page.waitForSelector('.file-result', { timeout: 4000 });
-                        console.log("🎉 Click worked! File list opened.");
-                        success = true;
-                        break; 
-                    } catch (e) {
-                        console.log("⚠️ Click failed. Retrying in 3s...");
-                        await sleep(3000);
-                    }
-                }
                 
-                if (!success) console.log("❌ All click attempts failed.");
+                await sleep(500); 
+                console.log("🖱️ Clicking Episode Download button...");
+                await page.click(episodeSelector);
+                
+                streams = await scrapeFiles(page);
 
             } catch (e) {
-                console.log(`ℹ️ Episode ${episode} not found.`);
-                return { streams: [] };
+                console.log(`❌ Could not find/click Episode ${episode} button: ${e.message}`);
             }
 
         } else {
-            // --- MOVIE LOGIC (UNCHANGED) ---
-            const directUrl = `https://bollywood.eu.org/?type=movie&id=${meta.tmdbId}`;
-            await page.goto(directUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+            const directUrl = `https://bollywood.eu.org/#/movie/${meta.tmdbId}`;
+            console.log(`🌍 Navigating to: ${directUrl}`);
+            await page.goto(directUrl, { waitUntil: 'networkidle2', timeout: 60000 });
 
-            console.log("⏳ Checking for 'View All Files' button...");
+            console.log("⏳ Searching for Movie Download button...");
             try {
-                await page.waitForFunction(
-                    () => [...document.querySelectorAll('button, a')].some(b => b.innerText.includes('View All Files')),
-                    { timeout: 15000 }
-                );
-                await page.evaluate(() => {
-                    const buttons = [...document.querySelectorAll('button, a')];
-                    const viewButton = buttons.find(b => b.innerText.includes('View All Files'));
-                    if (viewButton) viewButton.click();
-                });
-            } catch (e) {}
+                const btnSelector = '.gc-search-files-btn';
+                await page.waitForSelector(btnSelector, { timeout: 15000 });
+                await page.click(btnSelector);
+                
+                streams = await scrapeFiles(page);
+            } catch (e) {
+                console.log(`❌ Movie button issue: ${e.message}`);
+            }
         }
 
-        // --- SCRAPE RESULTS ---
-        console.log("⏳ Waiting for file list (30s timeout)...");
-        try {
-            await page.waitForSelector('.file-result', { timeout: 30000 });
-            
-            const content = await page.content();
-            const $ = cheerio.load(content);
-    
-            $(".file-result").each((i, element) => {
-                const fileName = $(element).find(".file-name").text().trim();
-                const fileSize = $(element).find("p:contains('Size:')").text().replace("Size:", "").trim();
-                const buttonHtml = $(element).find("button.download-button").attr("onclick");
-                const match = buttonHtml ? buttonHtml.match(/generateFileLink\('([^']+)'\)/) : null;
-    
-                if (fileName && match && match[1]) {
-                    streams.push({
-                        title: `${fileName}\n📦 ${fileSize}`,
-                        url: `${BASE_URL}/stream/${match[1]}` 
-                    });
-                }
-            });
-            console.log(`✅ Success! Found ${streams.length} files.`);
-
-        } catch(e) {
-             console.log("⚠️ File list did not appear (No streams found).");
-        }
+        console.log(`🎉 Final Result: Found ${streams.length} streams.`);
 
     } catch (error) {
         console.error("❌ Browser Error:", error.message);
@@ -212,7 +182,9 @@ app.all('/stream/:id', async (req, res) => {
         if (req.method === 'HEAD') {
             try {
                 const headRes = await axios.head(realUrl, { headers, validateStatus: () => true });
-                if (headRes.headers['content-length']) res.set('Content-Length', headRes.headers['content-length']);
+                if (headRes.headers['content-length']) {
+                    res.set('Content-Length', headRes.headers['content-length']);
+                }
                 res.status(200).end();
                 return;
             } catch (e) {
@@ -235,6 +207,6 @@ const addonRouter = getRouter(addonInterface);
 app.use("/", addonRouter);
 
 app.listen(PORT, () => {
-    console.log(`🚀 Addon Ready (Intelligent Wait)`);
+    console.log(`🚀 Addon Ready: Hashes`);
     console.log(`🌍 Base URL: ${BASE_URL}`);
 });
